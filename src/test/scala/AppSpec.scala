@@ -53,64 +53,102 @@ class CellActor extends Actor {
 
   def receive = {
 
-    case AddNeighbour(ref) =>
-      if (neighbours contains ref) {
-        sender ! AlreadyAddedNeighbour(ref)
+    case AddNeighbour(neighbour) =>
+      if (neighbours contains neighbour) {
+        sender ! AlreadyAddedNeighbour(neighbour)
       } else {
-        neighbours += ref
-        sender ! AddedNeighbour(ref)
+        addNeighbour(neighbour)
+        sender ! AddedNeighbour(neighbour)
       }
 
     case GetState(time) =>
       if (time <= 0) {
-        sender ! MyState(time, State.Dead)
+        respondWithState(time, State.Dead)
       } else if (states contains time) {
-        states(time).fold(
-          notReady => pendingStateRequests ::= StateRequestContext(sender, time),
-          readyResult => sender ! MyState(time, readyResult)
-        )
+        checkCachedStateForAction(time)
       } else {
-        neighbours foreach (_ ! GetState(time - 1))
-        states += (time -> Left(neighbours.map(Left(_)).toList))
-        pendingStateRequests ::= StateRequestContext(sender, time)
+        sendStateRequestsToNeighbours(time - 1)
+        queueStateRequest(time)
       }
 
     case MyState(lastTime, state) if states contains (lastTime + 1) =>
       val time = lastTime + 1
 
-      val newValue =
-        states(time) match {
-          case Left(pendingRequests) =>
-            val newPendingRequests =
-              pendingRequests map {
-                case Left(ref) if ref == sender => Right(state)
-                case anythingElse => anythingElse
-              }
-
-            if (newPendingRequests forall (_.isRight)) {
-              val liveCount = newPendingRequests count {
-                case Right(State.Live) => true
-                case _ => false
-              }
-              if (liveCount == 2 || liveCount == 3) {
-                Right(State.Live)
-              } else {
-                Right(State.Dead)
-              }
-            } else {
-              Left(newPendingRequests)
-            }
-          case anythingElse => anythingElse
-        }
-
-      states += (time -> newValue)
-
-      newValue.right.foreach { state =>
-        val (readyReqs, pendingReqs) = pendingStateRequests partition (_.time == time)
-        pendingStateRequests = pendingReqs
-        readyReqs foreach (_.sender ! MyState(time, state))
-      }
+      val newState = updatedState(time, state)
+      processPendingStateRequests(time, newState)
+      states += (time -> newState)
   }
+
+  def addNeighbour(newNeighbour: ActorRef): Unit =
+    neighbours += newNeighbour
+
+  def checkCachedStateForAction(time: Int): Unit =
+    states(time) match {
+      case Left(_) => queueStateRequest(time)
+      case Right(result) => respondWithState(time, result)
+    }
+
+  def queueStateRequest(time: Int): Unit =
+    pendingStateRequests ::= StateRequestContext(sender, time)
+
+  def respondWithState(time: Int, state: State, target: ActorRef = sender): Unit =
+    target ! MyState(time, state)
+
+  def sendStateRequestsToNeighbours(time: Int): Unit = {
+    neighbours foreach (_ ! GetState(time))
+
+    val pendingReplies = neighbours map (Left(_))
+    val pendingTime = time + 1
+    states += (pendingTime -> Left(pendingReplies.toList))
+  }
+
+  def updatedState(time: Int, state: State) =
+    states(time) match {
+      case Left(pendingRequests) => updatedPendingRequests(pendingRequests, state)
+      case anythingElse => anythingElse
+    }
+
+  def updatedPendingRequests(requests: List[PendingRequest], state: State) = {
+    val newPendingRequests = determineNewPendingRequests(requests, state)
+
+    if (isPendingRequestsReady(newPendingRequests))
+      Right(determineNewState(newPendingRequests))
+    else
+      Left(newPendingRequests)
+  }
+
+  def determineNewPendingRequests(requests: List[PendingRequest], state: State) =
+    requests map {
+      case Left(pendingActor) if pendingActor == sender => Right(state)
+      case anythingElse => anythingElse
+    }
+
+  def isPendingRequestsReady(requests: List[PendingRequest]): Boolean =
+    requests forall (_.isRight)
+
+  def determineNewState(requests: List[PendingRequest]): State = {
+    val liveCount = countLiveCells(requests)
+
+    if (liveCount == 2 || liveCount == 3)
+      State.Live
+    else
+      State.Dead
+  }
+
+  def countLiveCells(requests: List[PendingRequest]): Int =
+    requests count {
+      case Right(State.Live) => true
+      case _ => false
+    }
+
+  def processPendingStateRequests(time: Int, state: Either[List[PendingRequest], State]): Unit =
+    state.right.foreach { state =>
+      val (readyRequests, pendingRequests) =
+        pendingStateRequests partition (_.time == time)
+
+      readyRequests foreach (ctx => respondWithState(time, state, ctx.sender))
+      pendingStateRequests = pendingRequests
+    }
 }
 
 class AppSpec extends BaseSpec {
