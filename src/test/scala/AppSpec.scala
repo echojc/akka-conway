@@ -45,8 +45,10 @@ case class StateRequestContext(sender: ActorRef, time: Int)
 class CellActor extends Actor {
   import Msg._
 
+  type PendingRequest = Either[ActorRef, State]
+
   var neighbours = Set.empty[ActorRef]
-  var states = Map.empty[Int, Either[List[Either[ActorRef, State]], State]]
+  var states = Map.empty[Int, Either[List[PendingRequest], State]]
   var waitingStateRequests = List.empty[StateRequestContext]
 
   def receive = {
