@@ -9,9 +9,14 @@ abstract class BaseSpec(val _system: ActorSystem)
     with ImplicitSender
     with FunSpecLike
     with ShouldMatchers
-    with BeforeAndAfter {
+    with BeforeAndAfter
+    with BeforeAndAfterAll {
 
   def this() = this(ActorSystem("test-system"))
+
+  override def afterAll(): Unit = {
+    _system.shutdown()
+  }
 
   implicit class RouteRepliesToDeadLetter(ref: ActorRef) {
     def !![T](msg: T)(implicit system: ActorSystem) =
