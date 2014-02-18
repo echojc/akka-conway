@@ -49,7 +49,7 @@ class CellActor extends Actor {
 
   var neighbours = Set.empty[ActorRef]
   var states = Map.empty[Int, Either[List[PendingRequest], State]]
-  var waitingStateRequests = List.empty[StateRequestContext]
+  var pendingStateRequests = List.empty[StateRequestContext]
 
   def receive = {
 
@@ -66,13 +66,13 @@ class CellActor extends Actor {
         sender ! MyState(time, State.Dead)
       } else if (states contains time) {
         states(time).fold(
-          notReady => waitingStateRequests ::= StateRequestContext(sender, time),
+          notReady => pendingStateRequests ::= StateRequestContext(sender, time),
           readyResult => sender ! MyState(time, readyResult)
         )
       } else {
         neighbours foreach (_ ! GetState(time - 1))
         states += (time -> Left(neighbours.map(Left(_)).toList))
-        waitingStateRequests ::= StateRequestContext(sender, time)
+        pendingStateRequests ::= StateRequestContext(sender, time)
       }
 
     case MyState(lastTime, state) if states contains (lastTime + 1) =>
@@ -80,15 +80,15 @@ class CellActor extends Actor {
 
       val newValue =
         states(time) match {
-          case Left(waitingRequests) =>
-            val newWaitingRequests =
-              waitingRequests map {
+          case Left(pendingRequests) =>
+            val newPendingRequests =
+              pendingRequests map {
                 case Left(ref) if ref == sender => Right(state)
                 case anythingElse => anythingElse
               }
 
-            if (newWaitingRequests forall (_.isRight)) {
-              val liveCount = newWaitingRequests count {
+            if (newPendingRequests forall (_.isRight)) {
+              val liveCount = newPendingRequests count {
                 case Right(State.Live) => true
                 case _ => false
               }
@@ -98,7 +98,7 @@ class CellActor extends Actor {
                 Right(State.Dead)
               }
             } else {
-              Left(newWaitingRequests)
+              Left(newPendingRequests)
             }
           case anythingElse => anythingElse
         }
@@ -106,8 +106,8 @@ class CellActor extends Actor {
       states += (time -> newValue)
 
       newValue.right.foreach { state =>
-        val (readyReqs, pendingReqs) = waitingStateRequests partition (_.time == time)
-        waitingStateRequests = pendingReqs
+        val (readyReqs, pendingReqs) = pendingStateRequests partition (_.time == time)
+        pendingStateRequests = pendingReqs
         readyReqs foreach (_.sender ! MyState(time, state))
       }
   }
