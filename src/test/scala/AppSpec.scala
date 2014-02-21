@@ -48,7 +48,9 @@ class CellActor extends Actor {
   type PendingRequest = Either[ActorRef, State]
 
   var neighbours = Set.empty[ActorRef]
-  var states = Map.empty[Int, Either[List[PendingRequest], State]]
+  var states = Map[Int, Either[List[PendingRequest], State]](
+    0 -> Right(State.Dead)
+  )
   var pendingStateRequests = List.empty[StateRequestContext]
 
   def receive = {
@@ -62,21 +64,19 @@ class CellActor extends Actor {
       }
 
     case GetState(time) =>
-      if (time <= 0) {
+      if (time < 0) {
         respondWithState(time, State.Dead)
       } else if (states contains time) {
         checkCachedStateForAction(time)
       } else {
-        sendStateRequestsToNeighbours(time - 1)
+        sendStateRequestsForTime(time - 1)
         queueStateRequest(time)
       }
 
     case MyState(lastTime, state) if states contains (lastTime + 1) =>
       val time = lastTime + 1
-
-      val newState = updatedState(time, state)
-      processPendingStateRequests(time, newState)
-      states += (time -> newState)
+      states += (time -> updatedState(time, state))
+      processPendingStateRequests(time)
   }
 
   def addNeighbour(newNeighbour: ActorRef): Unit =
@@ -94,42 +94,45 @@ class CellActor extends Actor {
   def respondWithState(time: Int, state: State, target: ActorRef = sender): Unit =
     target ! MyState(time, state)
 
-  def sendStateRequestsToNeighbours(time: Int): Unit = {
-    neighbours foreach (_ ! GetState(time))
+  def sendStateRequestsForTime(time: Int): Unit = {
+    (neighbours + self) foreach (_ ! GetState(time))
 
     val pendingReplies = neighbours map (Left(_))
     val pendingTime = time + 1
     states += (pendingTime -> Left(pendingReplies.toList))
   }
 
-  def updatedState(time: Int, state: State) =
+  def updatedState(time: Int, state: State) = {
     states(time) match {
-      case Left(pendingRequests) => updatedPendingRequests(pendingRequests, state)
+      case Left(pendingRequests) =>
+        val newPendingRequests = updatedPendingRequests(pendingRequests, state)
+        if (isPendingRequestsReady(time, newPendingRequests))
+          Right(determineNewState(time, newPendingRequests))
+        else
+          Left(newPendingRequests)
+
       case anythingElse => anythingElse
     }
-
-  def updatedPendingRequests(requests: List[PendingRequest], state: State) = {
-    val newPendingRequests = determineNewPendingRequests(requests, state)
-
-    if (isPendingRequestsReady(newPendingRequests))
-      Right(determineNewState(newPendingRequests))
-    else
-      Left(newPendingRequests)
   }
 
-  def determineNewPendingRequests(requests: List[PendingRequest], state: State) =
+  def updatedPendingRequests(requests: List[PendingRequest], state: State) =
     requests map {
       case Left(pendingActor) if pendingActor == sender => Right(state)
       case anythingElse => anythingElse
     }
 
-  def isPendingRequestsReady(requests: List[PendingRequest]): Boolean =
-    requests forall (_.isRight)
+  def isPendingRequestsReady(time: Int, requests: List[PendingRequest]): Boolean =
+    (states.get(time - 1).map(_.isRight) == Some(true)) && (requests forall (_.isRight))
 
-  def determineNewState(requests: List[PendingRequest]): State = {
+  def determineNewState(time: Int, requests: List[PendingRequest]): State = {
     val liveCount = countLiveCells(requests)
+    val previousState = states(time - 1)
+    val deadConditionHolds =
+      previousState == Right(State.Dead) && (liveCount == 2 || liveCount == 3)
+    val liveConditionHolds =
+      previousState == Right(State.Live) && liveCount == 3
 
-    if (liveCount == 2 || liveCount == 3)
+    if (deadConditionHolds || liveConditionHolds)
       State.Live
     else
       State.Dead
@@ -141,8 +144,8 @@ class CellActor extends Actor {
       case _ => false
     }
 
-  def processPendingStateRequests(time: Int, state: Either[List[PendingRequest], State]): Unit =
-    state.right.foreach { state =>
+  def processPendingStateRequests(time: Int): Unit =
+    states(time).right.foreach { state =>
       val (readyRequests, pendingRequests) =
         pendingStateRequests partition (_.time == time)
 
@@ -152,17 +155,15 @@ class CellActor extends Actor {
 }
 
 class AppSpec extends BaseSpec {
-  var cell: ActorRef = _
+  var cell: TestActorRef[CellActor] = _
 
   before {
-    cell = newCell
+    cell = TestActorRef(new CellActor)
   }
 
   after {
     expectNoMsg(100.millis)
   }
-
-  def newCell = TestActorRef(new CellActor)
 
   describe("a cell actor") {
     describe("adding neighbours") {
@@ -198,6 +199,14 @@ class AppSpec extends BaseSpec {
         probe.expectMsg(Msg.GetState(0))
       }
 
+      it("sends a message to itself for state at t-1") {
+        val probe = TestProbe()
+        cell !! Msg.AddNeighbour(probe.ref)
+        cell !! Msg.GetState(2)
+        probe.expectMsg(Msg.GetState(1))
+        probe.expectMsg(Msg.GetState(0))
+      }
+
       describe("state change when dead") {
         Seq(
           0 -> State.Dead,
@@ -217,6 +226,41 @@ class AppSpec extends BaseSpec {
               cell !! Msg.AddNeighbour(probe.ref)
             }
 
+            cell ! Msg.GetState(1)
+            liveProbes foreach { probe =>
+              probe.expectMsg(Msg.GetState(0))
+              probe.reply(Msg.MyState(0, State.Live))
+            }
+            deadProbes foreach { probe =>
+              probe.expectMsg(Msg.GetState(0))
+              probe.reply(Msg.MyState(0, State.Dead))
+            }
+
+            expectMsg(Msg.MyState(1, targetState))
+          }
+        }
+      }
+
+      describe("state change when live") {
+        Seq(
+          0 -> State.Dead,
+          1 -> State.Dead,
+          2 -> State.Dead,
+          3 -> State.Live,
+          4 -> State.Dead,
+          5 -> State.Dead,
+          6 -> State.Dead,
+          7 -> State.Dead,
+          8 -> State.Dead
+        ) foreach { case (liveNeighbours, targetState) =>
+          it(s"becomes $targetState with $liveNeighbours live neighbours") {
+            val liveProbes = List.fill(liveNeighbours)(TestProbe())
+            val deadProbes = List.fill(8 - liveNeighbours)(TestProbe())
+            (liveProbes ++ deadProbes) foreach { probe =>
+              cell !! Msg.AddNeighbour(probe.ref)
+            }
+
+            cell.underlyingActor.states = Map(0 -> Right(State.Live))
             cell ! Msg.GetState(1)
             liveProbes foreach { probe =>
               probe.expectMsg(Msg.GetState(0))
